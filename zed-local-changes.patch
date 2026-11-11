@@ -1,0 +1,290 @@
+diff --git a/crates/agent/src/tests/mod.rs b/crates/agent/src/tests/mod.rs
+index 8cf42ea..d992588 100644
+--- a/crates/agent/src/tests/mod.rs
++++ b/crates/agent/src/tests/mod.rs
+@@ -4198,6 +4198,62 @@ async fn test_title_generation(cx: &mut TestAppContext) {
+     });
+ }
+ 
++#[gpui::test]
++async fn test_title_request_keeps_turn_prefix(cx: &mut TestAppContext) {
++    let ThreadTest {
++        model,
++        fake,
++        thread,
++        ..
++    } = setup(cx, TestModel::Fake).await;
++
++    let summary_model = fake.model("summary");
++    thread.update(cx, |thread, cx| {
++        thread.add_tool(EchoTool);
++        thread.set_summarization_model(Some(summary_model.clone()), cx)
++    });
++
++    let send = thread
++        .update(cx, |thread, cx| {
++            thread.send(ClientUserMessageId::new(), ["Hello"], cx)
++        })
++        .unwrap();
++    cx.run_until_parked();
++    let turn_request = fake.pending_completions_for(&model).pop().unwrap();
++    fake.send_last_text(&model, "Hey!");
++    fake.end_last(&model);
++    cx.run_until_parked();
++
++    // The title request starts with the turn's system prompt and history and
++    // offers the same tools, so a prefix-caching server reuses the turn.
++    let title_request = fake.pending_completions_for(&summary_model).pop().unwrap();
++    assert!(!turn_request.tools.is_empty());
++    assert_eq!(title_request.tools, turn_request.tools);
++    // (`cache` marks each request's own last message, so it is left out.)
++    let text = |messages: &[LanguageModelRequestMessage]| {
++        messages
++            .iter()
++            .map(|message| (message.role, message.string_contents()))
++            .collect::<Vec<_>>()
++    };
++    assert_eq!(
++        text(&title_request.messages[..turn_request.messages.len()]),
++        text(&turn_request.messages)
++    );
++    assert_eq!(
++        title_request.messages.last().unwrap().string_contents(),
++        agent_settings::SUMMARIZE_THREAD_PROMPT
++    );
++
++    fake.send_text(&summary_model, &title_request, "Greeting");
++    fake.end_stream(&summary_model, &title_request);
++    send.collect::<Vec<_>>().await;
++    cx.run_until_parked();
++    thread.read_with(cx, |thread, _| {
++        assert_eq!(thread.title(), Some("Greeting".into()))
++    });
++}
++
+ #[gpui::test]
+ async fn test_stream_thread_title_keeps_only_first_line(cx: &mut TestAppContext) {
+     let request = LanguageModelRequest::default();
+diff --git a/crates/agent/src/thread.rs b/crates/agent/src/thread.rs
+index a2583e3..bb0e09b 100644
+--- a/crates/agent/src/thread.rs
++++ b/crates/agent/src/thread.rs
+@@ -4216,7 +4216,7 @@ impl Thread {
+         log::debug!("Generating title with model: {:?}", model.name());
+ 
+         let temperature = AgentSettings::temperature_for_model(&model, cx);
+-        let request = build_thread_title_request(&self.id, &self.messages, temperature);
++        let request = self.build_title_request(temperature, cx);
+ 
+         let title_generation = cx.spawn(async move |_this, cx| {
+             stream_thread_title(model, request, cx)
+@@ -4332,6 +4332,44 @@ impl Thread {
+         let model = self
+             .model()
+             .ok_or_else(|| anyhow!(NoModelConfiguredError))?;
++
++        log::debug!("Building completion request");
++        log::debug!("Completion intent: {:?}", completion_intent);
++
++        let (available_tools, tools) = self.request_tools(cx);
++        log::debug!("Request includes {} tools", available_tools.len());
++        let messages = self.build_request_messages(available_tools, cx);
++        log::debug!("Request will include {} messages", messages.len());
++
++        let request = LanguageModelRequest {
++            thread_id: Some(self.id.to_string()),
++            prompt_cache_key: None,
++            prompt_id: Some(self.prompt_id.to_string()),
++            intent: Some(completion_intent),
++            messages,
++            tools,
++            tool_choice: None,
++            stop: Vec::new(),
++            temperature: AgentSettings::temperature_for_model(model, cx),
++            // Models that can't run with thinking disabled ignore the
++            // toggle state, which may be stale from a previously selected
++            // model that could.
++            thinking_allowed: self.thinking_enabled
++                || !model.supports_disabling_thinking_at_effort(self.thinking_effort.as_deref()),
++            thinking_effort: self.thinking_effort.clone(),
++            speed: self.speed(),
++            compact_at_tokens: None,
++            max_output_tokens: None,
++        };
++
++        log::debug!("Completion request built successfully");
++        Ok(request)
++    }
++
++    /// The running turn's tool names (for the system prompt) and tool
++    /// definitions, as the turn's completion requests send them. Both are
++    /// empty when no turn is running.
++    fn request_tools(&self, cx: &App) -> (Vec<SharedString>, Vec<LanguageModelRequestTool>) {
+         let sandboxing_enabled = crate::sandboxing::sandboxing_enabled(cx);
+         let tools = if let Some(turn) = self.running_turn.as_ref() {
+             turn.tools
+@@ -4381,42 +4419,13 @@ impl Thread {
+             Vec::new()
+         };
+ 
+-        log::debug!("Building completion request");
+-        log::debug!("Completion intent: {:?}", completion_intent);
+-
+         let available_tools: Vec<_> = self
+             .running_turn
+             .as_ref()
+             .map(|turn| turn.tools.keys().cloned().collect())
+             .unwrap_or_default();
+ 
+-        log::debug!("Request includes {} tools", available_tools.len());
+-        let messages = self.build_request_messages(available_tools, cx);
+-        log::debug!("Request will include {} messages", messages.len());
+-
+-        let request = LanguageModelRequest {
+-            thread_id: Some(self.id.to_string()),
+-            prompt_cache_key: None,
+-            prompt_id: Some(self.prompt_id.to_string()),
+-            intent: Some(completion_intent),
+-            messages,
+-            tools,
+-            tool_choice: None,
+-            stop: Vec::new(),
+-            temperature: AgentSettings::temperature_for_model(model, cx),
+-            // Models that can't run with thinking disabled ignore the
+-            // toggle state, which may be stale from a previously selected
+-            // model that could.
+-            thinking_allowed: self.thinking_enabled
+-                || !model.supports_disabling_thinking_at_effort(self.thinking_effort.as_deref()),
+-            thinking_effort: self.thinking_effort.clone(),
+-            speed: self.speed(),
+-            compact_at_tokens: None,
+-            max_output_tokens: None,
+-        };
+-
+-        log::debug!("Completion request built successfully");
+-        Ok(request)
++        (available_tools, tools)
+     }
+ 
+     fn enabled_tools(&self, cx: &App) -> BTreeMap<SharedString, Arc<dyn AnyAgentTool>> {
+@@ -4789,12 +4798,17 @@ impl Thread {
+         model: &LanguageModel,
+         cx: &App,
+     ) -> LanguageModelRequest {
++        // Send the running turn's system prompt and tools, as the turn's own
++        // requests do, so a server that reuses prompt prefixes reads only the
++        // compaction instruction instead of the whole thread again.
++        let (available_tools, tools) = self.request_tools(cx);
+         let mut request = LanguageModelRequest {
+             thread_id: Some(self.id.to_string()),
+             prompt_id: Some(self.prompt_id.to_string()),
+             intent: Some(CompletionIntent::ThreadContextSummarization),
+             temperature: AgentSettings::temperature_for_model(&model, cx),
+-            messages: self.build_request_messages_until(Vec::new(), insertion_ix, cx),
++            messages: self.build_request_messages_until(available_tools, insertion_ix, cx),
++            tools,
+             ..Default::default()
+         };
+ 
+@@ -4808,6 +4822,32 @@ impl Thread {
+         request
+     }
+ 
++    /// The thread-title request. While a turn is running it starts with the
++    /// turn's own system prompt and tools, so a server that reuses prompt
++    /// prefixes reads only the title instruction, and still holds the thread
++    /// for its next turn. With no turn running it is the plain history.
++    fn build_title_request(&self, temperature: Option<f32>, cx: &App) -> LanguageModelRequest {
++        let (available_tools, tools) = self.request_tools(cx);
++        if tools.is_empty() {
++            return build_thread_title_request(&self.id, &self.messages, temperature);
++        }
++        let mut request = LanguageModelRequest {
++            thread_id: Some(self.id.to_string()),
++            intent: Some(CompletionIntent::ThreadSummarization),
++            temperature,
++            messages: self.build_request_messages_until(available_tools, self.messages.len(), cx),
++            tools,
++            ..Default::default()
++        };
++        request.messages.push(LanguageModelRequestMessage {
++            role: Role::User,
++            content: vec![SUMMARIZE_THREAD_PROMPT.into()],
++            cache: false,
++            reasoning_details: None,
++        });
++        request
++    }
++
+     pub fn to_markdown(&self) -> String {
+         let mut markdown = messages_to_markdown(&self.messages);
+ 
+diff --git a/crates/agent/src/tools/terminal_tool.rs b/crates/agent/src/tools/terminal_tool.rs
+index 61c7693..76945fb 100644
+--- a/crates/agent/src/tools/terminal_tool.rs
++++ b/crates/agent/src/tools/terminal_tool.rs
+@@ -30,7 +30,9 @@ const COMMAND_OUTPUT_LIMIT: u64 = 16 * 1024;
+ ///
+ /// The output results will be shown to the user already, only list it again if necessary, avoid being redundant.
+ ///
+-/// Always set the working directory with the `cd` parameter, never with `cd` inside `command`; otherwise it will error.
++/// Set `cd` when you need a directory other than the project root. If omitted,
++/// Zed uses the project root in a single-root workspace. Never put `cd` inside
++/// `command`.
+ ///
+ /// Do not generate terminal commands that use shell substitutions or interpolations such as `$VAR`, `${VAR}`, `$(...)`, backticks, `$((...))`, `<(...)`, or `>(...)`. Resolve those values yourself before calling this tool, or ask the user for the literal value to use.
+ ///
+@@ -55,6 +57,7 @@ pub struct TerminalToolInput {
+     /// REMINDER: read-only git commands (`git log`, `git diff`, `git show`, `git blame`) MUST include `--no-pager` (e.g. `git --no-pager log`). Prefer `git --no-optional-locks status` over `git status` to avoid optional metadata writes. Git commands that may open an editor (`git rebase`, `git commit`, `git merge`, `git tag`) MUST be prefixed with `GIT_EDITOR=true ` (e.g. `GIT_EDITOR=true git rebase origin/main`). Otherwise the terminal will hang.
+     pub command: String,
+     /// Working directory: a project root directory or any subdirectory of one, given by name or absolute path. E.g. `my-project/src`, `/home/user/my-project`, or on Windows `my-project\src` or `C:\Users\me\my-project`.
++    #[serde(default)]
+     pub cd: String,
+     /// Optional maximum runtime (in milliseconds). If exceeded, the running terminal task is killed.
+     pub timeout_ms: Option<u64>,
+@@ -72,7 +75,9 @@ pub struct TerminalToolInput {
+ ///
+ /// The output results will be shown to the user already, only list it again if necessary, avoid being redundant.
+ ///
+-/// Always set the working directory with the `cd` parameter, never with `cd` inside `command`; otherwise it will error.
++/// Set `cd` when you need a directory other than the project root. If omitted,
++/// Zed uses the project root in a single-root workspace. Never put `cd` inside
++/// `command`.
+ ///
+ /// Do not generate terminal commands that use shell substitutions or interpolations such as `$VAR`, `${VAR}`, `$(...)`, backticks, `$((...))`, `<(...)`, or `>(...)`. Resolve those values first or ask the user for the literal value to use.
+ ///
+@@ -97,6 +102,7 @@ pub struct SandboxedTerminalToolInput {
+     /// REMINDER: read-only git commands (`git log`, `git diff`, `git show`, `git blame`) MUST include `--no-pager` (e.g. `git --no-pager log`). Prefer `git --no-optional-locks status` over `git status` to avoid optional metadata writes. Git commands that may open an editor (`git rebase`, `git commit`, `git merge`, `git tag`) MUST be prefixed with `GIT_EDITOR=true ` (e.g. `GIT_EDITOR=true git rebase origin/main`). Otherwise the terminal will hang.
+     pub command: String,
+     /// Working directory: a project root directory or any subdirectory of one, given by name or absolute path. E.g. `my-project/src`, `/home/user/my-project`, or on Windows `my-project\src` or `C:\Users\me\my-project`.
++    #[serde(default)]
+     pub cd: String,
+     /// Optional maximum runtime (in milliseconds). If exceeded, the running terminal task is killed.
+     pub timeout_ms: Option<u64>,
+@@ -3231,6 +3237,26 @@ mod tests {
+         );
+     }
+ 
++    #[test]
++    fn test_terminal_cd_defaults_to_project_root_when_absent() {
++        let input: TerminalToolInput = serde_json::from_value(serde_json::json!({
++            "command": "pwd",
++        }))
++        .expect("terminal input without cd should deserialize");
++
++        assert!(input.cd.is_empty());
++    }
++
++    #[test]
++    fn test_sandboxed_terminal_cd_defaults_to_project_root_when_absent() {
++        let input: SandboxedTerminalToolInput = serde_json::from_value(serde_json::json!({
++            "command": "pwd",
++        }))
++        .expect("sandboxed terminal input without cd should deserialize");
++
++        assert!(input.cd.is_empty());
++    }
++
+     #[test]
+     fn test_sandbox_flags_default_to_none_when_absent() {
+         // The model is expected to omit the sandbox fields entirely on most

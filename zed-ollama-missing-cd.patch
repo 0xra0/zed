@@ -1,0 +1,47 @@
+diff --git a/crates/agent/src/tools/terminal_tool.rs b/crates/agent/src/tools/terminal_tool.rs
+index 61c7693e04..0000000000 100644
+--- a/crates/agent/src/tools/terminal_tool.rs
++++ b/crates/agent/src/tools/terminal_tool.rs
+@@ -33,1 +33,3 @@
+-/// Always set the working directory with the `cd` parameter, never with `cd` inside `command`; otherwise it will error.
++/// Set `cd` when you need a directory other than the project root. If omitted,
++/// Zed uses the project root in a single-root workspace. Never put `cd` inside
++/// `command`.
+@@ -55,4 +57,5 @@
+     /// REMINDER: read-only git commands (`git log`, `git diff`, `git show`, `git blame`) MUST include `--no-pager` (e.g. `git --no-pager log`). Prefer `git --no-optional-locks status` over `git status` to avoid optional metadata writes. Git commands that may open an editor (`git rebase`, `git commit`, `git merge`, `git tag`) MUST be prefixed with `GIT_EDITOR=true ` (e.g. `GIT_EDITOR=true git rebase origin/main`). Otherwise the terminal will hang.
+     pub command: String,
+     /// Working directory: a project root directory or any subdirectory of one, given by name or absolute path. E.g. `my-project/src`, `/home/user/my-project`, or on Windows `my-project\src` or `C:\Users\me\my-project`.
++    #[serde(default)]
+     pub cd: String,
+@@ -75,1 +78,3 @@
+-/// Always set the working directory with the `cd` parameter, never with `cd` inside `command`; otherwise it will error.
++/// Set `cd` when you need a directory other than the project root. If omitted,
++/// Zed uses the project root in a single-root workspace. Never put `cd` inside
++/// `command`.
+@@ -97,4 +102,5 @@
+     /// REMINDER: read-only git commands (`git log`, `git diff`, `git show`, `git blame`) MUST include `--no-pager` (e.g. `git --no-pager log`). Prefer `git --no-optional-locks status` over `git status` to avoid optional metadata writes. Git commands that may open an editor (`git rebase`, `git commit`, `git merge`, `git tag`) MUST be prefixed with `GIT_EDITOR=true ` (e.g. `GIT_EDITOR=true git rebase origin/main`). Otherwise the terminal will hang.
+     pub command: String,
+     /// Working directory: a project root directory or any subdirectory of one, given by name or absolute path. E.g. `my-project/src`, `/home/user/my-project`, or on Windows `my-project\src` or `C:\Users\me\my-project`.
++    #[serde(default)]
+     pub cd: String,
+@@ -3233,0 +3240,20 @@
++    #[test]
++    fn test_terminal_cd_defaults_to_project_root_when_absent() {
++        let input: TerminalToolInput = serde_json::from_value(serde_json::json!({
++            "command": "pwd",
++        }))
++        .expect("terminal input without cd should deserialize");
++
++        assert!(input.cd.is_empty());
++    }
++
++    #[test]
++    fn test_sandboxed_terminal_cd_defaults_to_project_root_when_absent() {
++        let input: SandboxedTerminalToolInput = serde_json::from_value(serde_json::json!({
++            "command": "pwd",
++        }))
++        .expect("sandboxed terminal input without cd should deserialize");
++
++        assert!(input.cd.is_empty());
++    }
++
